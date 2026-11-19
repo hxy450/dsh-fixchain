@@ -21,6 +21,7 @@ import { join, resolve } from 'node:path'
 import Schema from '@deepseek-ai/schemastery'
 import { pythonCommand, runPython, startServer, stopServer } from './lib/python.js'
 import { locateSession } from './lib/sessions.js'
+import { prepareOffline, checkOffline, memoryRuntime, workerEnvironment, commandTokens } from './lib/offline.js'
 
 export const name = 'dsh-fixchain'
 export const inject = ['commands']
@@ -30,6 +31,7 @@ const PROMPT = '请读取当前目录 CLAUDE.md 和 job.json，按其中入口 s
 const RESUME = '这是同一任务的续跑；先读取已有产物及 last-feedback.json（若有），复用已完成工作。'
 
 export const Config = Schema.object({
+  memoryRuntime: Schema.string().default('').description('Standalone MigLoop runtime JSON; defaults to HMBOT_MEMORY_RUNTIME'),
   a2hMemory: Schema.string().default('').description('a2h-memory checkout with dsh support; empty: $A2H_MEMORY'),
   python: Schema.string().default('').description('Python 3.10+ with PyYAML; empty: DSH_FIXCHAIN_PYTHON, else `py -3` / `python3`'),
   pythonArgs: Schema.array(Schema.string()).default([]),
@@ -46,11 +48,14 @@ function dshHome() {
 
 function settings(config) {
   const repo = config.a2hMemory || process.env.A2H_MEMORY || ''
+  const runtime = config.memoryRuntime || process.env.HMBOT_MEMORY_RUNTIME || ''
+  const rt = runtime ? readJson(runtime) : {}
   return {
     repo: repo ? resolve(repo) : '',
-    python: config.python ? { cmd: config.python, args: [...(config.pythonArgs ?? [])] } : pythonCommand({}),
+    runtime,
+    python: config.python || rt.python ? { cmd: config.python || rt.python, args: [...(config.pythonArgs ?? [])] } : pythonCommand({}),
     runsDir: resolve(config.runsDir || join(dshHome(), 'fixchain-runs')),
-    dsh: config.dshCommand?.length ? config.dshCommand : [process.execPath, process.argv[1]],
+    dsh: config.dshCommand?.length ? config.dshCommand : [process.execPath, rt.dshCli || process.argv[1]],
     workerProfile: config.workerProfile || 'headless',
     workerModel: config.workerModel || 'deepseek-flash',
     viewHost: config.viewHost || '127.0.0.1',
@@ -82,7 +87,8 @@ const list = v => (v === undefined ? [] : [].concat(v))
 const readJson = p => JSON.parse(readFileSync(p, 'utf8'))
 
 async function view(ctx, s, viewers, tokens) {
-  requireRepo(s)
+  const rt = s.runtime ? await memoryRuntime(s.runtime) : null
+  if (!rt) requireRepo(s)
   const { positional } = parseArgs(tokens)
   if (!positional.length) throw new Error('give at least one Session id (e.g. the migration and its repair)')
   const persistence = ctx.get('sessionPersistence')
@@ -92,10 +98,11 @@ async function view(ctx, s, viewers, tokens) {
   const stamp = Date.now().toString(36)
   const work = join(s.runsDir, 'views', `${key}-${stamp}`)
   mkdirSync(work, { recursive: true })
-  const env = { PYTHONPATH: join(s.repo, 'migloop', 'src') }
+  const env = { PYTHONPATH: rt ? join(rt.migloop.directory, 'src') : join(s.repo, 'migloop', 'src') }
   for (const f of found) {
     const out = join(work, 'pool', f.id.replace(/^session-/, '').slice(0, 8))
-    const r = await runPython(s.python, ['-m', 'migloop.inquiry.source_adapters', f.path, '--out', out, '--sessions-root', f.root], { env })
+    const args = rt ? ['-c', 'import json,sys; from migloop.adapters.dsh_source import freeze_tree; print(json.dumps(freeze_tree(sys.argv[1],sys.argv[2],sys.argv[3])))', f.path, out, f.root] : ['-m', 'migloop.inquiry.source_adapters', f.path, '--out', out, '--sessions-root', f.root]
+    const r = await runPython(s.python, args, { env })
     if (r.code !== 0) throw new Error(`freezing ${f.id} failed:\n${(r.stderr || r.stdout).slice(-1200)}`)
   }
   const db = join(work, 'index.sqlite')
@@ -120,8 +127,13 @@ function stopViewers(viewers) {
 }
 
 async function prepare(ctx, s, tokens) {
-  requireRepo(s)
   const { flags } = parseArgs(tokens)
+  if (flags.offline) {
+    if (!flags.out) throw new Error('Offline prepare requires --offline <config.json> --out <new directory>')
+    return JSON.stringify(await prepareOffline(resolve(String(flags.offline)), resolve(String(flags.out)), { runtime: s.runtime }))
+  }
+  if (!s.repo) throw new Error('Use /fixchain prepare --offline <config.json> --out <run>; standalone MigLoop requires no a2h-memory checkout')
+  requireRepo(s)
   if (!flags.migration || !list(flags.repair).length) throw new Error('need --migration <id> and --repair <id>')
   const persistence = ctx.get('sessionPersistence')
   const migration = await locateSession(persistence, String(flags.migration))
@@ -156,13 +168,14 @@ function workerState(run) {
 }
 
 async function check(s, run) {
+  if (s.runtime) return checkOffline(run, { runtime: s.runtime })
   const r = await runPython(s.python, [join(s.repo, 'distill', 'distill.py'), 'check', '--run', run], { timeoutMs: 900000 })
   const last = r.stdout.trim().split(/\r?\n/).filter(Boolean).at(-1) ?? '{}'
   try { return JSON.parse(last) } catch { return { ok: false, error: (r.stderr || r.stdout).slice(-800) } }
 }
 
 function cards(s, workers, tokens) {
-  requireRepo(s)
+  if (!s.runtime) requireRepo(s)
   const { flags, positional } = parseArgs(tokens)
   const run = resolve(positional[0] || '')
   if (!existsSync(join(run, 'job.json'))) throw new Error(`not a prepared run directory: ${run}`)
@@ -186,7 +199,7 @@ function cards(s, workers, tokens) {
   const args = [...s.dsh.slice(1), '--profile', s.workerProfile, '--json', '--approval-policy', 'never',
     ...(resume ? ['--session-id', state.sessionId] : []), resume ? `${PROMPT}${RESUME}` : PROMPT]
   const child = spawn(s.dsh[0], args, { cwd: run, windowsHide: true,
-    env: { ...process.env, MIGLOOP_ANALYSIS_CONTEXT: context, PYTHONIOENCODING: 'utf-8', PYTHONDONTWRITEBYTECODE: '1' } })
+    env: { ...process.env, ...(s.runtime ? workerEnvironment(s.runtime) : {}), MIGLOOP_ANALYSIS_CONTEXT: context, PYTHONIOENCODING: 'utf-8', PYTHONDONTWRITEBYTECODE: '1' } })
   workers.set(run, child)
   const events = createWriteStream(join(run, `dsh-worker-${n}.jsonl`))
   const stderr = createWriteStream(join(run, `dsh-worker-${n}.stderr.log`))
@@ -260,9 +273,9 @@ export function apply(ctx, config = {}) {
     description: 'Repair-chain attribution: view | prepare | cards | status | check | stop',
     input: { hint: 'view <session…> | prepare --migration <id> --repair <id> | cards <run> | status <run>' },
     handler: async (invocation) => {
-      const tokens = invocation.rawInput.trim().split(/\s+/).filter(Boolean)
-      const verb = tokens.shift() ?? 'help'
       try {
+        const tokens = commandTokens(invocation.rawInput)
+        const verb = tokens.shift() ?? 'help'
         let text
         if (verb === 'view') text = await view(ctx, s, viewers, tokens)
         else if (verb === 'stop') text = stopViewers(viewers)
@@ -270,11 +283,11 @@ export function apply(ctx, config = {}) {
         else if (verb === 'cards') text = cards(s, workers, tokens)
         else if (verb === 'status') text = status(workers, tokens)
         else if (verb === 'check') {
-          requireRepo(s)
+          if (!s.runtime) requireRepo(s)
           const r = await check(s, resolve(tokens[0] || ''))
           text = r.ok ? `交付检查通过：${r.card_count} 张卡，revision ${r.revision}` : `交付检查未通过：${r.error}`
         } else {
-          text = '/fixchain view <会话…> 看轨迹；prepare --migration <id> --repair <id> 准备制卡；cards <run> 在 dsh 里制卡；status <run>；check <run>；stop'
+          text = '/fixchain prepare --offline <config.json> --out <run>：原生离线材料制备（无需 a2h-memory）；prepare --migration <id> --repair <id>：原有在线流程；cards <run>：独立子代理制卡归并；check <run>；status <run>；view <会话…>；stop'
         }
         return { kind: 'success', text }
       } catch (error) {
@@ -282,4 +295,13 @@ export function apply(ctx, config = {}) {
       }
     },
   }), 'dsh-fixchain: /fixchain')
+
+  ctx.inject(['tools'], scope => {
+    scope.effect(() => scope.get('tools').register({
+      name: 'memory_distill', description: 'Standalone MigLoop Memory material preparation and strict delivery check. prepare takes an explicit native-format offline config and a new output; check requires completed independent cards and a revision-bound reading pack. No a2h-memory checkout.',
+      parameters: { type: 'object', properties: { action: { enum: ['prepare', 'check'] }, config: { type: 'string' }, output: { type: 'string' }, run: { type: 'string' } }, required: ['action'], additionalProperties: false },
+      output: { schema: { type: 'object', additionalProperties: true }, render: (_args, result) => [{ type: 'text', text: JSON.stringify(result) }] },
+      execute: (args, exec) => args.action === 'prepare' ? prepareOffline(args.config, args.output, { runtime: s.runtime, signal: exec?.signal }) : checkOffline(args.run, { runtime: s.runtime, signal: exec?.signal }),
+    }))
+  })
 }

@@ -49,6 +49,38 @@ dsh plugin --profile web add /path/to/dsh-fixchain
 
 制卡会话的工作区就是 run 目录（dsh 的 workspace-write 沙箱只放行这里的写入），工程、安卓源码和 skills 只读。Windows 上 skill 包是在 Python 临时目录里打的，带一份只给属主的 ACL，dsh 沙箱读不了；`cards` 启动前会把 run 下的 `skills/` 改回继承 run 目录的权限（`icacls skills /reset /T`）。
 
+## 独立离线材料入口
+
+离线会话可通过显式材料目录准备，不需要 a2h-memory checkout；制卡与归并仍复用公开 MigLoop skills，不在插件里重写算法。此路径需要带 DSH adapter 的公开 hxy450/migloop 源码、Python 3.10+／PyYAML 和构建后的 skills，例如当前验证版本 c72c0db50ee39ddd5dfe0fbb79ee02e6ef023925（skills 0.10.10）：
+
+```sh
+python /absolute/migloop/skills/migloop-memory-maintain/scripts/build_bundle.py --out /absolute/built-skills
+```
+
+运行时 JSON 只描述三个必要依赖；无需评测仓库、控制台或 UI：
+
+```json
+{"schemaVersion":"migloop.distillation-runtime/1","python":"/absolute/venv/bin/python","skills":"/absolute/built-skills","migloop":{"directory":"/absolute/migloop"}}
+```
+
+配置 memoryRuntime 或 HMBOT_MEMORY_RUNTIME 指向此文件。材料配置 JSON 示例：
+
+```json
+{"materials":"/absolute/offline-materials","format":"native-pool","app":"example","maxIssues":1,"scope":"Investigate one retained repair using original evidence"}
+```
+
+```sh
+/fixchain prepare --offline "/absolute/offline-config.json" --out "/absolute/new run"
+/fixchain cards "/absolute/new run"
+/fixchain check "/absolute/new run"
+```
+
+支持 claude／codex／deveco／dsh／a2h-export/4／native-pool，由原生 MigLoop 解析。dsh 格式还需显式 sessions 路径数组；其他格式保留目录中的原文及附件。a2h-export/4 的完整性应由调用方先校验，prepare 本身不是导出校验器。输出必须是材料之外的新目录。可选 baseStore、scope、maxIssues、holdoutApps，以及 checkpointRepository／generationRef／finalRef 用于基线和历史 Git 证据；后者要求 bare Git 仓库。
+
+提供可 import 的 ./offline API 和 memory_distill prepare/check 工具，CLI 与工具共用入口。prepare/check 不调用模型，cards 才启动真实 DSH；最小 runtime 沿用当前 DSH_HOME／PATH，完整运行时可显式提供 dshCli、dshHome。交付检查要求独立卡片、全部派工闭合、精确 store revision 及阅读包摘要；partial／缺片／未完成不能视为成功。
+
+未配置 runtime 时，原来的 a2h-memory 和在线 Session 流程保持。为兼容现有调用方，同时接受 hmbot.rsi.distillation-runtime/1 与 hmbot.memory.runtime/1 运行时 schema；插件不依赖这些调用方的安装程序。离线能力目前验证领域为迁移返修，未证明 PPT 或任意 Skill 优化适用。
+
 ## 冒烟测试
 
 ```sh
